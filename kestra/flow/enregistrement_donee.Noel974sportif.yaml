@@ -1,0 +1,110 @@
+id: Noel974sportif
+namespace: enregistrement_donee
+
+retry:
+  type: exponential      
+  maxAttempts: 3
+  interval: PT5S          
+  maxInterval: PT30S
+
+tasks:
+  - id: load_rh
+    type: io.kestra.plugin.scripts.python.Script
+    namespaceFiles:
+      enabled: true
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: kestra_kestra_kestra-net
+    beforeCommands:
+      - pip install pandas psycopg2-binary openpyxl
+    script: |
+      import pandas as pd
+      import psycopg2
+
+      df = pd.read_excel("donneerh.xlsx")
+
+      conn = psycopg2.connect(
+        host="postgres_sportif",
+        database="sportif",
+        user="kestra",
+        password="kestra"
+      )
+      cur = conn.cursor()
+
+      for _, row in df.iterrows():
+        cur.execute("""
+            INSERT INTO employees (id_salarie, nom, prenom, date_naissance, bu, date_embauche, salaire_brut, type_contrat, jours_cp, adresse_domicile, moyen_deplacement)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id_salarie) DO UPDATE SET
+                salaire_brut = EXCLUDED.salaire_brut,
+                date_naissance = EXCLUDED.date_naissance,
+                bu = EXCLUDED.bu,
+                date_embauche = EXCLUDED.date_embauche,
+                type_contrat = EXCLUDED.type_contrat,
+                jours_cp = EXCLUDED.jours_cp,
+                adresse_domicile = EXCLUDED.adresse_domicile,
+                moyen_deplacement = EXCLUDED.moyen_deplacement
+        """, (
+            row["ID salarié"],
+            row["Nom"],
+            row["Prénom"],
+            row["Date de naissance"],
+            row["BU"],
+            row["Date d'embauche"],
+            row["Salaire brut"],
+            row["Type de contrat"],
+            row["Nombre de jours de CP"],
+            row["Adresse du domicile"],
+            row["Moyen de déplacement"]
+        ))
+
+      conn.commit()
+      cur.close()
+      conn.close()
+      
+  - id: load_sportif
+    type: io.kestra.plugin.scripts.python.Script
+    namespaceFiles:
+      enabled: true
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: kestra_kestra_kestra-net
+    beforeCommands:
+      - pip install pandas psycopg2-binary openpyxl
+    script: |
+      import pandas as pd
+      import psycopg2
+
+      df_sport = pd.read_excel("donneesportif.xlsx")
+
+      conn = psycopg2.connect(
+        host="postgres_sportif",
+        database="sportif",
+        user="kestra",
+        password="kestra"
+      )
+      cur = conn.cursor()
+
+      for _, row in df_sport.iterrows():
+        cur.execute("""
+            INSERT INTO sport_declaration (id_salarie, sport_pratique)
+            VALUES (%s, %s)
+            ON CONFLICT (id_salarie) DO UPDATE SET sport_pratique = EXCLUDED.sport_pratique
+        """, (
+            row["ID salarié"],
+            row["Pratique d'un sport"] if pd.notna(row["Pratique d'un sport"]) else None
+        ))
+
+      conn.commit()
+      cur.close()
+      conn.close()
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    runIf: "{{ outputs.soda_tests.result.hasFailures }}"
+    payload: |
+      {
+        "text": "⚠️ Jeux donnée non enregistre dans la base de donnée ."
+      }      

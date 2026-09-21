@@ -6,10 +6,11 @@ volumes:
   kestra-data:
     driver: local
 
+networks:
+  kestra_kestra-net:
+    driver: bridge
+
 services:
-  # ---------------------------------------------------------
-  # PostgreSQL pour ton projet sportif (RH + activités)
-  # ---------------------------------------------------------
   postgres_sportif:
     image: postgres:16
     container_name: postgres_sportif
@@ -23,10 +24,9 @@ services:
       - ./postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     restart: unless-stopped
+    networks:
+      - kestra_kestra-net
 
-  # ---------------------------------------------------------
-  # Redpanda (Kafka)
-  # ---------------------------------------------------------
   redpanda:
     image: redpandadata/redpanda:latest
     container_name: redpanda_sportif
@@ -52,10 +52,9 @@ services:
       - "19092:19092"
       - "9644:9644"
     restart: unless-stopped
+    networks:
+      - kestra_kestra-net
 
-  # ---------------------------------------------------------
-  # PostgreSQL interne de Kestra (métadonnées)
-  # ---------------------------------------------------------
   postgres:
     image: postgres:18
     container_name: kestra_postgres
@@ -70,19 +69,18 @@ services:
       interval: 30s
       timeout: 10s
       retries: 10
+    networks:
+      - kestra_kestra-net
 
-  # ---------------------------------------------------------
-  # Kestra
-  # ---------------------------------------------------------
   kestra:
-    image: kestra/kestra:latest
+    image: kestra/kestra:v1.3.35
+    pull_policy: missing
     container_name: kestra
-    pull_policy: always
     stop_grace_period: 6m
-
     user: "root"
     command: server standalone
-
+    env_file:
+      - .env
     volumes:
       - ./donnee:/app/data
       - kestra-data:/app/storage
@@ -90,36 +88,31 @@ services:
       - /tmp/kestra-wd:/tmp/kestra-wd
 
     environment:
-      SECRET_SLACK_WEBHOOK: "aHR0cHM6Ly9ob29rcy5zbGFjay5jb20vc2VydmljZXMvVDBCU1lOM0JDRjYvQjBCU0RKQTAzUkQvNGdzU08zRG9iVGVReHlqajZQdnhrTGNQ"
       KESTRA_CONFIGURATION: |
+        plugins:
+          - io.kestra.plugin.soda
         datasources:
           postgres:
             url: jdbc:postgresql://postgres:5432/kestra
             driverClassName: org.postgresql.Driver
             username: kestra
             password: k3str4
-
         kestra:
           server:
             basic-auth:
-              username: admin
+              username: admin@kestra.io
               password: Admin1234!
-
           repository:
             type: postgres
-
           storage:
             type: local
             local:
               base-path: "/app/storage"
-
           queue:
             type: postgres
-
           tasks:
             tmp-dir:
               path: /tmp/kestra-wd/tmp
-
           url: http://localhost:8080/
 
     ports:
@@ -129,3 +122,6 @@ services:
     depends_on:
       postgres:
         condition: service_started
+
+    networks:
+      - kestra_kestra-net

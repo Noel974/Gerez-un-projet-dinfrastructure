@@ -5,38 +5,25 @@ from datetime import timedelta
 
 fake = Faker()
 
-# Adresse de l'entreprise (POC)
-COMPANY_ADDRESS = "1362 Avenue des Platanes, 34970 Lattes"
+COORDS = [
+    (3.9048, 43.5670),  # Lattes
+    (3.8767, 43.6108),  # Montpellier centre
+    (3.9333, 43.5833),  # Pérols
+    (3.9000, 43.6500),  # Castelnau-le-Lez
+    (3.8500, 43.6000),  # Saint-Jean-de-Védas
+]
 
-def geocode_address(address: str):
-    """
-    Géocode une adresse en utilisant Nominatim (OpenStreetMap).
-    Retourne (lon, lat)
-    """
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1
-    }
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    data = resp.json()
+SPORT_TYPES = ["running", "cycling", "walking", "hiking"]
 
-    if not data:
-        raise ValueError(f"Adresse introuvable : {address}")
-
-    return float(data[0]["lon"]), float(data[0]["lat"])
-
-
-SPORT_TYPES = ["running", "cycling", "walking"]
+CALORIES_PER_MIN = {
+    "running": 11,
+    "cycling": 8,
+    "walking": 5,
+    "hiking": 7,
+}
 
 
 def get_osrm_route(start, end, profile="foot"):
-    """
-    Appel OSRM pour obtenir distance + durée entre deux points.
-    profile: 'foot' pour marche/course, 'bike' pour vélo.
-    """
     url = (
         f"http://router.project-osrm.org/route/v1/{profile}/"
         f"{start[0]},{start[1]};{end[0]},{end[1]}?overview=false"
@@ -49,34 +36,31 @@ def get_osrm_route(start, end, profile="foot"):
     return route["distance"], route["duration"]
 
 
-def generate_activity(employee_id: int, home_address: str):
-    """
-    Génère une activité sportive réaliste basée sur :
-    - géocodage de l'adresse du salarié
-    - géocodage de l'entreprise
-    - OSRM pour distance + durée
-    - Faker pour les dates + commentaires
-    """
-
-    # Sport aléatoire
+def generate_activity(employee_id: int, historical: bool = False):
     sport_type = random.choice(SPORT_TYPES)
-    profile = "foot" if sport_type in ["running", "walking"] else "bike"
+    profile = "foot" if sport_type in ["running", "walking", "hiking"] else "bike"
 
-    # Géocodage domicile
-    home_coord = geocode_address(home_address)
+    start = random.choice(COORDS)
+    end = random.choice(COORDS)
 
-    # Géocodage entreprise
-    company_coord = geocode_address(COMPANY_ADDRESS)
+    distance_m, duration_s = get_osrm_route(start, end, profile)
 
-    # Distance + durée via OSRM
-    distance_m, duration_s = get_osrm_route(home_coord, company_coord, profile)
+    if historical:
+        start_dt = fake.date_time_between(start_date='-365d', end_date='now')
+    else:
+        start_dt = fake.date_time_between(start_date='-1h', end_date='now')
 
-    # Dates réalistes
-    start_dt = fake.date_time_this_month()
     end_dt = start_dt + timedelta(seconds=duration_s)
 
-    # Commentaire réaliste
-    comment = fake.sentence(nb_words=8)
+    if sport_type == "hiking":
+        comment = f"Randonnée de {fake.city()}, je vous la conseille c'est top"
+    else:
+        comment = fake.sentence(nb_words=8)
+
+    # Échappe les apostrophes pour éviter de casser les requêtes SQL en aval
+    comment = comment.replace("'", "''")
+
+    calories = round((duration_s / 60) * CALORIES_PER_MIN[sport_type])
 
     activity = {
         "employee_id": employee_id,
@@ -84,33 +68,17 @@ def generate_activity(employee_id: int, home_address: str):
         "start_date": start_dt.isoformat(),
         "end_date": end_dt.isoformat(),
         "distance_m": round(distance_m, 2),
+        "distance_km": round(distance_m / 1000, 1),
         "moving_time_s": int(duration_s),
+        "moving_time_min": round(duration_s / 60),
         "elapsed_time_s": int(duration_s) + random.randint(10, 120),
         "comment": comment,
-        "home_address": home_address,
-        "home_lon": home_coord[0],
-        "home_lat": home_coord[1],
-        "company_lon": company_coord[0],
-        "company_lat": company_coord[1],
+        "calories": calories,
+        "start_lon": start[0],
+        "start_lat": start[1],
+        "end_lon": end[0],
+        "end_lat": end[1],
+        "historical": historical,
     }
 
     return activity
-
-
-def main():
-    # Exemple : adresses RH (à remplacer par tes vraies données)
-    employees = [
-        {"id": 1, "adresse": "25 Rue des Oliviers, Montpellier"},
-        {"id": 2, "adresse": "4 Avenue du Stade, Pérols"},
-        {"id": 3, "adresse": "10 Rue du Faubourg, Lattes"},
-        {"id": 4, "adresse": "12 Boulevard Victor Hugo, Montpellier"},
-        {"id": 5, "adresse": "3 Rue des Aigrettes, Castelnau-le-Lez"},
-    ]
-
-    for emp in employees:
-        activity = generate_activity(emp["id"], emp["adresse"])
-        print(activity)
-
-
-if __name__ == "__main__":
-    main()

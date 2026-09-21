@@ -1,0 +1,64 @@
+id: noel974sportif
+namespace: sportif_rh
+
+triggers:
+  - id: kafka_stream
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    topic: strava.activities
+    groupId: sportif_rh_realtime
+    properties:
+      bootstrap.servers: redpanda_sportif:9092
+    valueDeserializer: JSON
+
+retry:
+  type: exponential
+  maxAttempts: 3
+  interval: PT5S
+  maxInterval: PT30S
+
+tasks:
+  - id: get_employee
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres_sportif:5432/sportif
+    username: "{{ secret('PG_USERNAME') }}"
+    password: "{{ secret('PG_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT *
+      FROM employees
+      WHERE id_salarie = {{ trigger.value.employee_id }};
+
+  - id: insert_pg
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    runIf: "{{ outputs.get_employee.size > 0 }}"
+    url: jdbc:postgresql://postgres_sportif:5432/sportif
+    username: "{{ secret('PG_USERNAME') }}"
+    password: "{{ secret('PG_PASSWORD') }}"
+    sql: |
+      INSERT INTO sport_activities_raw (
+        id_salarie,
+        date_activite,
+        type_activite,
+        distance_km,
+        duree_min,
+        calories,
+        commentaire
+      )
+      VALUES (
+        {{ outputs.get_employee.rows[0].id_salarie }},
+        '{{ trigger.value.start_date }}',
+        '{{ trigger.value.sport_type }}',
+        {{ trigger.value.distance_km }},
+        {{ trigger.value.moving_time_min }},
+        {{ trigger.value.calories }},
+        '{{ trigger.value.comment }}'
+      );
+
+  - id: slack_message
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    runIf: "{{ trigger.value.historical == false and outputs.get_employee.size > 0 }}"
+    payload: |
+      {
+        "text": "{% if trigger.value.sport_type == 'running' %}Bravo {{ outputs.get_employee.rows[0].prenom }} ! Tu viens de courir {{ trigger.value.distance_km }} km en {{ trigger.value.moving_time_min }} min ! Quelle énergie ! 🔥🏃{% elseif trigger.value.sport_type == 'cycling' %}Magnifique sortie vélo {{ outputs.get_employee.rows[0].prenom }} ! {{ trigger.value.distance_km }} km avalés en {{ trigger.value.moving_time_min }} min ! 🚴💨{% elseif trigger.value.sport_type == 'walking' %}Bravo {{ outputs.get_employee.rows[0].prenom }} ! Une marche de {{ trigger.value.distance_km }} km en {{ trigger.value.moving_time_min }} min, parfait pour se ressourcer ! 🚶🌿{% elseif trigger.value.sport_type == 'hiking' %}Magnifique {{ outputs.get_employee.rows[0].prenom }} ! Une randonnée de {{ trigger.value.distance_km }} km terminée et un nouveau spot à découvrir ! 🌄 (\"{{ trigger.value.comment }}\") 🏕{% else %}Belle activité sportive {{ outputs.get_employee.rows[0].prenom }} !{% endif %}"
+      }

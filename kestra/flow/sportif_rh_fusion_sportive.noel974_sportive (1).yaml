@@ -1,0 +1,166 @@
+id: noel974_sportive
+namespace: sportif_rh_fusion_sportive
+
+retry:
+  type: exponential
+  maxAttempts: 3
+  interval: PT5S
+  maxInterval: PT30S
+
+tasks:
+  - id: fusion
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://postgres_sportif:5432/sportif
+    username: "{{ secret('PG_USERNAME') }}"
+    password: "{{ secret('PG_PASSWORD') }}"
+    sql: |
+      DROP TABLE IF EXISTS sport_activities_final CASCADE;
+
+      CREATE TABLE sport_activities_final AS
+      SELECT
+          e.id_salarie,
+          e.nom,
+          e.prenom,
+          r.date_activite,
+          r.type_activite,
+          r.distance_km,
+          r.duree_min,
+          r.calories,
+          r.commentaire,
+          'historique' AS source
+      FROM sport_activities_raw r
+      JOIN employees e ON e.id_salarie = r.id_salarie
+
+      UNION ALL
+
+      SELECT
+          e.id_salarie,
+          e.nom,
+          e.prenom,
+          s.start_date AS date_activite,
+          s.sport_type AS type_activite,
+          s.distance_m / 1000 AS distance_km,
+          s.moving_time_s / 60 AS duree_min,
+          NULL AS calories,
+          s.comment AS commentaire,
+          'streaming' AS source
+      FROM sport_activities_stream s
+      JOIN employees e ON e.id_salarie = s.employee_id;
+
+  - id: calcul_avantages
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://postgres_sportif:5432/sportif
+    username: "{{ secret('PG_USERNAME') }}"
+    password: "{{ secret('PG_PASSWORD') }}"
+    sql: |
+      DROP TABLE IF EXISTS avantages_salaries CASCADE;
+
+      CREATE TABLE avantages_salaries AS
+      SELECT
+          e.id_salarie,
+          e.nom,
+          e.prenom,
+          e.salaire_brut,
+          e.moyen_deplacement,
+
+          CASE
+              WHEN e.moyen_deplacement IN ('Marche/running', 'Vélo/Trottinette/Autres') THEN true
+              ELSE false
+          END AS eligible_prime_sportive,
+          CASE
+              WHEN e.moyen_deplacement IN ('Marche/running', 'Vélo/Trottinette/Autres')
+                  THEN ROUND(e.salaire_brut * 0.05, 2)
+              ELSE 0
+          END AS montant_prime_sportive,
+
+          COALESCE(act.nb_activites, 0) AS nb_activites_annee,
+          CASE
+              WHEN COALESCE(act.nb_activites, 0) >= 15 THEN true
+              ELSE false
+          END AS eligible_jours_bien_etre,
+          CASE
+              WHEN COALESCE(act.nb_activites, 0) >= 15 THEN 5
+              ELSE 0
+          END AS jours_bien_etre
+
+      FROM employees e
+      LEFT JOIN (
+          SELECT id_salarie, COUNT(*) AS nb_activites
+          FROM sport_activities_final
+          WHERE date_activite >= NOW() - INTERVAL '1 year'
+          GROUP BY id_salarie
+      ) act ON act.id_salarie = e.id_salarie;
+
+  - id: recreate_views
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://postgres_sportif:5432/sportif
+    username: "{{ secret('PG_USERNAME') }}"
+    password: "{{ secret('PG_PASSWORD') }}"
+    sql: |
+      CREATE OR REPLACE VIEW vue_kpi_avantages AS
+      SELECT
+          id_salarie, nom, prenom, salaire_brut, moyen_deplacement,
+          eligible_prime_sportive, montant_prime_sportive,
+          nb_activites_annee, eligible_jours_bien_etre, jours_bien_etre
+      FROM avantages_salaries;
+
+      CREATE OR REPLACE VIEW vue_activites_par_mois AS
+      SELECT
+          DATE_TRUNC('month', date_activite) AS mois,
+          type_activite,
+          COUNT(*) AS nb_activites,
+          SUM(distance_km) AS distance_totale_km,
+          AVG(distance_km) AS distance_moyenne_km
+      FROM sport_activities_final
+      GROUP BY DATE_TRUNC('month', date_activite), type_activite
+      ORDER BY mois;
+
+      CREATE OR REPLACE VIEW vue_synthese_financiere AS
+      SELECT
+          COUNT(*) FILTER (WHERE eligible_prime_sportive) AS nb_salaries_prime,
+          SUM(montant_prime_sportive) AS cout_total_prime_sportive,
+          COUNT(*) FILTER (WHERE eligible_jours_bien_etre) AS nb_salaries_jours_bien_etre,
+          SUM(jours_bien_etre) AS total_jours_bien_etre_accordes,
+          COUNT(*) AS nb_salaries_total
+      FROM avantages_salaries;
+
+  - id: soda_tests
+    type: io.kestra.plugin.soda.Scan
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: kestra_kestra_kestra-net
+    configuration:
+      data_source kestra:
+        type: postgres
+        connection:
+          host: postgres_sportif
+          port: 5432
+          database: sportif
+          username: "{{ secret('PG_USERNAME') }}"
+          password: "{{ secret('PG_PASSWORD') }}"
+    checks:
+      checks for sport_activities_final:
+        - row_count > 0
+        - invalid_count(distance_km):
+            valid min: 0
+            fail: when > 0
+        - missing_count(id_salarie) = 0
+      checks for avantages_salaries:
+        - row_count > 0
+        - invalid_count(montant_prime_sportive):
+            valid min: 0
+            fail: when > 0
+        - invalid_count(jours_bien_etre):
+            valid values: [0, 5]
+            fail: when > 0
+    requirements:
+      - soda-core-postgres
+
+  - id: notify_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    runIf: "{{ outputs.soda_tests.result.hasFailures }}"
+    payload: |
+      {
+        "text": "⚠️ Tests de qualité échoués sur sport_activities_final ou avantages_salaries. Merci de vérifier les données."
+      }

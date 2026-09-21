@@ -1,0 +1,169 @@
+id: noel974_sportive
+namespace: deplacement_rh
+
+tasks:
+  - id: read_employees
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres_sportif:5432/sportif
+    username: "{{ secret('PG_USERNAME') }}"
+    password: "{{ secret('PG_PASSWORD') }}"
+    fetchType: FETCH
+    sql: |
+      SELECT id_salarie AS id, prenom, nom, adresse_domicile AS adresse, moyen_deplacement AS mode_deplacement
+      FROM employees
+      WHERE adresse_domicile IS NOT NULL AND adresse_domicile != ''
+        AND moyen_deplacement IS NOT NULL AND moyen_deplacement != ''
+      LIMIT 5;
+
+  - id: check_all_employees
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: kestra_kestra_kestra-net
+    beforeCommands:
+      - pip install requests
+    env:
+      GOOGLE_MAPS_API_KEY: "{{ secret('GOOGLE_MAPS_API_KEY') }}"
+      SLACK_WEBHOOK: "{{ secret('SLACK_WEBHOOK') }}"
+    script: |
+        import os
+        import json
+        import requests
+
+        # Données provenant de la tâche Kestra read_employees
+        employees = {{ outputs.read_employees.rows }}
+
+        # Mapping des modes déclarés → modes Google Maps
+        MODE_MAP = {
+            "Marche/running": "walking",
+            "Vélo/Trottinette/Autres": "bicycling",
+            "véhicule thermique/électrique": "driving",
+            "Transports en commun": "transit",
+        }
+
+        # Seuils métier
+        SEUIL_MAP = {
+            "Marche/running": 15000,
+            "Vélo/Trottinette/Autres": 25000,
+        }
+
+        DEST = "1362 Avenue des Platanes, 34970 Lattes"
+
+        # Compteurs
+        nb_ok = 0
+        nb_alertes = 0
+        nb_sans_reponse = 0
+        nb_sans_regle = 0
+        nb_status_not_ok = 0
+
+        api_test_ok = True
+
+
+        def check_google_quota(data):
+            """
+            Vérifie le statut global de l'API Google Maps.
+            Retourne True si OK, sinon envoie une alerte Slack et stoppe le workflow.
+            """
+            root_status = data.get("status")
+
+            if root_status == "OK":
+                return True
+
+            # Gestion des erreurs globales Google Maps
+            if root_status == "OVER_QUERY_LIMIT":
+                msg = "🚨 Google Maps API — QUOTA DÉPASSÉ !"
+            elif root_status == "REQUEST_DENIED":
+                msg = "🚫 Google Maps API — Requête refusée (clé invalide ou API non activée)."
+            elif root_status == "INVALID_REQUEST":
+                msg = "⚠️ Google Maps API — Requête invalide (paramètre manquant)."
+            else:
+                msg = f"⚠️ Google Maps API — Erreur inconnue : {root_status}"
+
+            # Envoi Slack
+            requests.post(os.environ["SLACK_WEBHOOK"], json={"text": msg})
+
+            # Stop workflow
+            raise Exception(msg)
+
+
+        for emp in employees:
+            mode_fr = emp["mode_deplacement"]
+            mode_google = MODE_MAP.get(mode_fr, "transit")
+
+            resp = requests.get(
+                "https://maps.googleapis.com/maps/api/distancematrix/json",
+                params={
+                    "origins": emp["adresse"],
+                    "destinations": DEST,
+                    "mode": mode_google,
+                    "key": os.environ["GOOGLE_MAPS_API_KEY"],
+                }
+            )
+
+            # Vérification HTTP
+            if resp.status_code != 200:
+                api_test_ok = False
+                raise Exception(f"❌ API Google Maps HTTP {resp.status_code}")
+
+            data = resp.json()
+
+            # Vérification quota / erreurs globales
+            check_google_quota(data)
+
+            # Extraction sécurisée
+            try:
+                element = data["rows"][0]["elements"][0]
+            except (KeyError, IndexError):
+                print(f"⚠️ Pas de réponse exploitable pour {emp['prenom']} {emp['nom']}")
+                nb_sans_reponse += 1
+                continue
+
+            # Vérification du statut de l’élément
+            if element.get("status") != "OK":
+                print(f"⚠️ Statut {element.get('status')} pour {emp['prenom']} {emp['nom']}")
+                nb_status_not_ok += 1
+                continue
+
+            dist_m = element["distance"]["value"]
+            seuil = SEUIL_MAP.get(mode_fr)
+
+            if seuil is None:
+                print(f"ℹ️ Pas de règle pour {emp['prenom']} {emp['nom']} (mode: {mode_fr}, {round(dist_m/1000,1)} km)")
+                nb_sans_regle += 1
+                continue
+
+            # Vérification métier
+            if dist_m > seuil:
+                text = (
+                    f"🚨 Déclaration incohérente détectée ! "
+                    f"Salarié : {emp['prenom']} {emp['nom']}. "
+                    f"Adresse : {emp['adresse']}. "
+                    f"Mode déclaré : {mode_fr}. "
+                    f"Distance réelle : {round(dist_m / 1000, 1)} km."
+                )
+                requests.post(os.environ["SLACK_WEBHOOK"], json={"text": text})
+                print(f"🚨 Alerte envoyée pour {emp['prenom']} {emp['nom']}")
+                nb_alertes += 1
+            else:
+                print(f"✅ OK pour {emp['prenom']} {emp['nom']} ({round(dist_m/1000,1)} km)")
+                nb_ok += 1
+
+
+        # Résumé global final
+        print("\n======================")
+        print("📊 RÉSUMÉ GLOBAL")
+        print("======================")
+
+        print("✔️ API Google Maps répond correctement" if api_test_ok else "❌ API Google Maps ne répond pas correctement")
+
+        print(f"➡️ {nb_ok} employés OK")
+        print(f"➡️ {nb_alertes} alertes envoyées")
+        print(f"➡️ {nb_sans_reponse} sans réponse exploitable")
+        print(f"➡️ {nb_status_not_ok} réponses avec status ≠ OK")
+        print(f"➡️ {nb_sans_regle} employés sans règle applicable")
+        print(f"➡️ Total employés analysés : {len(employees)}")
+
+
+    
+    
+    
